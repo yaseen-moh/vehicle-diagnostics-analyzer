@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Vehicle Diagnostics Analyzer — Live Demo</title>
+<style>
+  body { margin:0; background:#0d1117; color:#e6e6f0; font-family: 'Segoe UI', system-ui, sans-serif; }
+  #wrap { max-width: 980px; margin:0 auto; padding:20px; }
+  h1 { font-size:1.3rem; margin-bottom:4px; }
+  h2 { font-size:1rem; margin: 22px 0 8px; color:#c8c8e0; }
+  p.sub { color:#9090a8; margin-top:0; font-size:0.9rem; }
+  canvas { background:#111726; border-radius:8px; display:block; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr; gap:20px; margin-top:16px; }
+  table { width:100%; border-collapse:collapse; font-size:0.8rem; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid #232a3a; }
+  th { color:#9090a8; font-weight:500; }
+  tr.risk-row { cursor:pointer; }
+  tr.risk-row:hover { background:#1a2233; }
+  tr.selected { background:#213248; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:0.72rem; font-weight:600; }
+  .badge.high { background:#4a1620; color:#ff9494; }
+  .badge.med { background:#4a3a16; color:#ffd494; }
+  .badge.low { background:#12321f; color:#7fffb0; }
+  #history h3 { font-size:0.95rem; margin-bottom:6px; color:#c8c8e0; }
+  #history table { margin-top:6px; }
+  .note { font-size:0.78rem; color:#6a6a88; margin-top:14px; }
+  .upload-row { display:flex; align-items:center; gap:10px; background:#151b28; padding:10px 14px; border-radius:8px; margin-bottom:14px; flex-wrap:wrap;}
+  .upload-row span { font-size:0.78rem; color:#9090a8; }
+  input[type=file] { background:#1c2333; color:#e6e6f0; border:1px solid #3a3a5c; padding:6px 10px; border-radius:6px; font-size:0.8rem;}
+  button { background:#3a3a5c; color:#fff; border:none; padding:8px 14px; border-radius:6px; cursor:pointer; font-size:0.85rem;}
+  button:hover { background:#4a4a72; }
+  #uploadStatus { font-size:0.78rem; color:#7fffd4; }
+  .controls { display:flex; gap:20px; margin-bottom:10px; flex-wrap:wrap; }
+  label { font-size:0.8rem; color:#b0b0c8; display:flex; flex-direction:column; gap:4px; }
+  input[type=range] { width:160px; }
+  select { background:#1c2333; color:#e6e6f0; border:1px solid #3a3a5c; padding:6px 10px; border-radius:6px; font-size:0.8rem;}
+  #tableFilter { margin-bottom:8px; }
+  #ticketTableWrap { max-height:280px; overflow-y:auto; border:1px solid #232a3a; border-radius:8px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>Vehicle Repair & Cascading-Failure Analyzer</h1>
+  <p class="sub">All analysis runs live in the browser from the embedded synthetic fleet, or your own uploaded repair-ticket CSV.</p>
+
+  <div class="upload-row">
+    <label style="flex-direction:row; align-items:center; gap:8px;">
+      <span>Upload repair tickets CSV (vehicle_id, service_date, mileage, system, symptom, cost_usd):</span>
+      <input type="file" id="csvUpload" accept=".csv">
+    </label>
+    <button id="resetDataBtn">Use built-in synthetic fleet</button>
+    <span id="uploadStatus"></span>
+  </div>
+
+  <div class="controls">
+    <label>Cascading-failure mileage window: <span id="windowVal">3000</span> mi
+      <input type="range" id="windowSlider" min="500" max="10000" step="500" value="3000"></label>
+    <label>Minimum distinct systems to flag: <span id="minSysVal">3</span>
+      <input type="range" id="minSysSlider" min="2" max="6" value="3"></label>
+  </div>
+
+  <div class="grid">
+    <div>
+      <canvas id="costChart" width="440" height="260"></canvas>
+    </div>
+    <div>
+      <table id="riskTable">
+        <thead><tr><th>Vehicle</th><th>Systems</th><th>Risk</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="history"></div>
+
+  <h2>All repair tickets</h2>
+  <label id="tableFilter">Filter by vehicle:
+    <select id="vehicleFilter"></select>
+  </label>
+  <div id="ticketTableWrap">
+    <table id="ticketTable"><thead>
+      <tr><th>Vehicle</th><th>Date</th><th>Mileage</th><th>System</th><th>Symptom</th><th>Cost</th></tr>
+    </thead><tbody></tbody></table>
+  </div>
+
+  <p class="note">Built-in data is fully synthetic (see generate_sample_data.py) — no real shop or customer data. Everything computes client-side; uploaded files never leave your browser.</p>
+</div>
+
+<script src="embedded_data.js"></script>
+<script>
+let TICKETS = DEFAULT_TICKETS;
+
+function topCostSystems(tickets, limit=10){
+  const bySystem = {};
+  tickets.forEach(t=>{
+    if(!bySystem[t.system]) bySystem[t.system] = { system:t.system, count:0, totalCost:0 };
+    bySystem[t.system].count++;
+    bySystem[t.system].totalCost += t.cost_usd;
+  });
+  return Object.values(bySystem).sort((a,b)=>b.totalCost-a.totalCost).slice(0,limit);
+}
+
+function cascadingRiskScores(tickets, mileageWindow, minSystems){
+  const byVehicle = {};
+  tickets.forEach(t=>{
+    if(!byVehicle[t.vehicle_id]) byVehicle[t.vehicle_id] = [];
+    byVehicle[t.vehicle_id].push(t);
+  });
+
+  const results = [];
+  for(const [vehicleId, rows] of Object.entries(byVehicle)){
+    const sorted = rows.slice().sort((a,b)=>a.mileage-b.mileage);
+    let best = null;
+    for(let i=0;i<sorted.length;i++){
+      const windowRows = sorted.filter(r=>r.mileage>=sorted[i].mileage && r.mileage<=sorted[i].mileage+mileageWindow);
+      const systems = new Set(windowRows.map(r=>r.system));
+      if(!best || systems.size > best.distinctSystems){
+        best = { distinctSystems: systems.size, systems: [...systems].sort(), ticketCount: windowRows.length };
+      }
+    }
+    if(best && best.distinctSystems >= Math.min(minSystems, 1)){
+      results.push({ vehicleId, ...best });
+    }
+  }
+
+  const maxSystems = Math.max(...results.map(r=>r.distinctSystems), 1);
+  const maxTickets = Math.max(...results.map(r=>r.ticketCount), 1);
+  results.forEach(r=>{
+    r.riskScore = Math.round((60*(r.distinctSystems/maxSystems) + 40*(r.ticketCount/maxTickets))*10)/10;
+  });
+
+  return results
+    .filter(r=>r.distinctSystems >= minSystems)
+    .sort((a,b)=>b.riskScore-a.riskScore);
+}
+
+function drawCostChart(costs){
+  const canvas = document.getElementById('costChart');
+  const ctx = canvas.getContext('2d');
+  const W=canvas.width, H=canvas.height, pad=95;
+  ctx.fillStyle='#111726'; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#c8c8e0'; ctx.font='13px sans-serif';
+  ctx.fillText('Total repair cost by system', 12, 18);
+
+  if(!costs.length) return;
+  const maxCost = Math.max(...costs.map(c=>c.totalCost));
+  const barH = (H-40)/costs.length;
+  costs.forEach((c,i)=>{
+    const y = 30 + i*barH;
+    const w = (c.totalCost/maxCost) * (W-pad-20);
+    ctx.fillStyle = '#5aa9ff';
+    ctx.fillRect(pad, y, w, barH*0.6);
+    ctx.fillStyle='#c8c8e0'; ctx.font='11px sans-serif'; ctx.textAlign='right';
+    ctx.fillText(c.system, pad-6, y+barH*0.4);
+    ctx.textAlign='left';
+    ctx.fillText('$'+Math.round(c.totalCost).toLocaleString(), pad+w+6, y+barH*0.4);
+  });
+}
+
+function riskBadge(score){
+  if(score>=70) return '<span class="badge high">HIGH</span>';
+  if(score>=40) return '<span class="badge med">MED</span>';
+  return '<span class="badge low">LOW</span>';
+}
+
+function buildRiskTable(risk){
+  const tbody = document.querySelector('#riskTable tbody');
+  tbody.innerHTML = '';
+  if(!risk.length){
+    tbody.innerHTML = '<tr><td colspan="3" style="color:#8888a8;">No vehicles meet this threshold — try lowering the minimum systems slider.</td></tr>';
+    document.getElementById('history').innerHTML = '';
+    return;
+  }
+  risk.slice(0,10).forEach(r=>{
+    const tr = document.createElement('tr');
+    tr.className = 'risk-row';
+    tr.innerHTML = `<td>${r.vehicleId}</td><td>${r.distinctSystems}</td><td>${riskBadge(r.riskScore)} ${r.riskScore}</td>`;
+    tr.addEventListener('click', ()=>{
+      document.querySelectorAll('.risk-row').forEach(row=>row.classList.remove('selected'));
+      tr.classList.add('selected');
+      showHistory(r.vehicleId, r.systems);
+    });
+    tbody.appendChild(tr);
+  });
+  tbody.firstChild.click();
+}
+
+function showHistory(vehicleId, systems){
+  const rows = TICKETS.filter(t=>t.vehicle_id===vehicleId).sort((a,b)=>a.mileage-b.mileage);
+  const el = document.getElementById('history');
+  el.innerHTML = `<h3>${vehicleId} — repair timeline (systems involved: ${systems.join(', ')})</h3>
+    <table>
+      <thead><tr><th>Date</th><th>Mileage</th><th>System</th><th>Symptom</th><th>Repair</th><th>Cost</th></tr></thead>
+      <tbody>
+        ${rows.map(r=>`<tr>
+          <td>${r.service_date}</td><td>${Number(r.mileage).toLocaleString()}</td>
+          <td>${r.system}</td><td>${r.symptom}</td><td>${r.repair_performed||''}</td>
+          <td>$${Number(r.cost_usd).toFixed(0)}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+function populateVehicleFilter(){
+  const vehicles = [...new Set(TICKETS.map(t=>t.vehicle_id))].sort();
+  const sel = document.getElementById('vehicleFilter');
+  sel.innerHTML = '<option value="">All vehicles</option>' + vehicles.map(v=>`<option value="${v}">${v}</option>`).join('');
+}
+
+function drawTicketTable(){
+  const filter = document.getElementById('vehicleFilter').value;
+  const rows = (filter ? TICKETS.filter(t=>t.vehicle_id===filter) : TICKETS)
+    .slice().sort((a,b)=>a.vehicle_id.localeCompare(b.vehicle_id) || a.mileage-b.mileage);
+  const tbody = document.querySelector('#ticketTable tbody');
+  tbody.innerHTML = rows.map(r=>`<tr>
+    <td>${r.vehicle_id}</td><td>${r.service_date}</td><td>${Number(r.mileage).toLocaleString()}</td>
+    <td>${r.system}</td><td>${r.symptom}</td><td>$${Number(r.cost_usd).toFixed(0)}</td>
+  </tr>`).join('');
+}
+
+function update(){
+  const mileageWindow = +document.getElementById('windowSlider').value;
+  const minSystems = +document.getElementById('minSysSlider').value;
+  document.getElementById('windowVal').textContent = mileageWindow;
+  document.getElementById('minSysVal').textContent = minSystems;
+
+  drawCostChart(topCostSystems(TICKETS));
+  buildRiskTable(cascadingRiskScores(TICKETS, mileageWindow, minSystems));
+  drawTicketTable();
+}
+
+// --- CSV upload ---
+function parseCSV(text){
+  const lines = text.trim().split(/\r?\n/);
+  const headers = lines[0].split(',').map(h=>h.trim());
+  return lines.slice(1).filter(l=>l.trim().length).map(line=>{
+    const cells = line.split(',').map(c=>c.trim());
+    const row = {};
+    headers.forEach((h,i)=>{
+      const raw = cells[i];
+      const num = parseFloat(raw);
+      row[h] = ['mileage','cost_usd','labor_hours'].includes(h) ? num : raw;
+    });
+    return row;
+  });
+}
+
+document.getElementById('csvUpload').addEventListener('change', (e)=>{
+  const file = e.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = (evt)=>{
+    try{
+      const parsed = parseCSV(evt.target.result);
+      const required = ['vehicle_id','mileage','system'];
+      const hasRequired = required.every(r => Object.keys(parsed[0]||{}).includes(r));
+      if(!hasRequired){
+        document.getElementById('uploadStatus').textContent =
+          'CSV must include at least vehicle_id, mileage, system columns.';
+        return;
+      }
+      TICKETS = parsed.map(r=>({ ...r, cost_usd: r.cost_usd||0 }));
+      populateVehicleFilter();
+      update();
+      document.getElementById('uploadStatus').textContent = `Loaded ${parsed.length} rows from ${file.name}`;
+    } catch(err){
+      document.getElementById('uploadStatus').textContent = 'Could not parse CSV: ' + err.message;
+    }
+  };
+  reader.readAsText(file);
+});
+
+document.getElementById('resetDataBtn').addEventListener('click', ()=>{
+  TICKETS = DEFAULT_TICKETS;
+  document.getElementById('csvUpload').value = '';
+  document.getElementById('uploadStatus').textContent = 'Using built-in synthetic fleet.';
+  populateVehicleFilter();
+  update();
+});
+
+document.getElementById('windowSlider').addEventListener('input', update);
+document.getElementById('minSysSlider').addEventListener('input', update);
+document.getElementById('vehicleFilter').addEventListener('change', drawTicketTable);
+
+populateVehicleFilter();
+update();
+</script>
+</body>
+</html>
